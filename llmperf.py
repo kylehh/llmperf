@@ -7,6 +7,7 @@ import random
 from dotenv import load_dotenv
 import pandas as pd
 from transformers import LlamaTokenizerFast
+import numpy as np
 
 FRAMEWORKS = [
     "anyscale",
@@ -29,7 +30,6 @@ os.environ["TOKENIZERS_PARALLELISM"] = "true"
 
 tokenizer = LlamaTokenizerFast.from_pretrained("hf-internal-testing/llama-tokenizer")
 sys_prompt = "You are a helpful assistant that respeonds with the answer in the most concise possible way."
-
 
 class LineIterator:
     """
@@ -71,7 +71,6 @@ class LineIterator:
             self.buffer.seek(0, io.SEEK_END)
             self.buffer.write(chunk["PayloadPart"]["Bytes"])
 
-
 # NOTE: The defaults are set to mirror our production traffic
 def prompt_generator(num_digits=3, min_lines=15, max_lines=1000, file_lines=[]) -> str:
     # Step 1: Generate a random number
@@ -112,6 +111,13 @@ def validate(ep_config, sample_lines):
             {"role": "system", "content": sys_prompt},
             {"role": "user", "content": prompt},
         ]
+        np.random.seed(int(time.time()))
+        max_tokens = 9999
+        while max_tokens > args.max_tokens:
+            max_tokens = round(np.random.normal(loc=args.max_tokens, scale=args.max_tokens/3))
+        if not args.sampled:
+            max_tokens = args.max_tokens
+
         try:
             st = time.time()
             response = openai.ChatCompletion.create(
@@ -119,7 +125,7 @@ def validate(ep_config, sample_lines):
                 messages=messages,
                 api_key=ep_config["api_key"],
                 api_base=ep_config["api_base"],
-                max_tokens=args.max_tokens,
+                max_tokens=max_tokens,
                 # Please keep temp at 0. Otherwise increases the number of mismatches.
                 temperature=0,
                 # Do not set to false. You will get bogus results.
@@ -264,8 +270,29 @@ def endpoint_evaluation(ep_config, sample_lines):
     print(f"Overall execution time {overall_end_time-overall_start_time}")
     return query_results
 
+def endpoint_evaluation_qps(ep_config, sample_lines):
+    query_results = []
+    num_rounds = int(args.total_requests / args.concur_requests)
+    futures = []
+    for i in range(num_rounds):
+        print(f"Starting round {i}")
+        st = time.time()
+        futures.extend([
+            validate.remote(ep_config, sample_lines)
+            for _ in range(args.concur_requests)
+        ])
+        et = time.time()
+        sleep_time = np.random.poisson(100)/100
+        print(f"Send {args.concur_requests} requests in {(et-st):.2f} second.")
+        print(f"Need to sleep {sleep_time} second")
+        if not args.sampled:
+            sleep_time = 1
+        time.sleep(sleep_time-(et-st))
+    
+    query_results = ray.get(futures)
+    return query_results
 
-def results_analysis(query_results, results_dict):
+def results_analysis(query_results, results_dict, all_time):
     df = pd.DataFrame(
         query_results,
         columns=[
@@ -311,6 +338,10 @@ def results_analysis(query_results, results_dict):
         mean_ttft = cdf["ttft"].mean()
         max_ttft = cdf["ttft"].max()
         gt_3_ttft = len(cdf[cdf["ttft"] > 3]) / len(cdf)
+        allin_tokens = cdf["tokens_in"].sum()
+        allout_tokens = cdf["tokens_out"].sum()
+        allin_tp = allin_tokens/all_time
+        allout_tp = allout_tokens/all_time
         print(f"Mean End-to-end: {mean_e2e*1000.0:.0f} ms")
         print(
             f"Mean TTFT: {mean_ttft*1000:.0f} ms (mean tokens in: {mean_tokens_in:.0f}, out: {mean_tokens_out:.0f})"
@@ -319,6 +350,9 @@ def results_analysis(query_results, results_dict):
         print(f"TTFT > 3 s: {gt_3_ttft*100:.2f}%")
         print(
             f"ITL (out): {cdf.inter_tokens_delay.mean()*1000:.2f} ms/token, mean tokens/s output (out): {cdf.out_tokens_per_s.mean():.2f} token/s"
+        )
+        print(
+        f"Total tokens(in/out) {allin_tokens}/{allout_tokens}, Total processing time {all_time:.2f}s, throughput(in/out) {allin_tp:.2f}/{allout_tp:.2f} tokens/s"
         )
         # Put things in a dictionary and save the results
         results_dict["end_timestamp"] = datetime.datetime.fromtimestamp(ts).isoformat()
@@ -329,7 +363,11 @@ def results_analysis(query_results, results_dict):
         results_dict["total_tokens_per_s"] = float(cdf.total_tokens_per_s.mean())
         results_dict["out_tokens_per_s"] = float(cdf.out_tokens_per_s.mean())
         results_dict["inter_token_delay"] = float(cdf.inter_tokens_delay.mean() * 1000)
-
+        results_dict["all_in_tokens"] = float(allin_tokens)
+        results_dict["all_out_tokens"] = float(allout_tokens)
+        results_dict["all_time"] = all_time
+        results_dict["Input_Thoughput"] = allin_tp
+        results_dict["Output_Thoughput"] = allout_tp
     def error_analysis(df):
         # Group exceptions based on exceptions cause.
         exceptions = df[df.valid == "Exception"]
@@ -406,6 +444,16 @@ if __name__ == "__main__":
         default=117,
         help="Random seed to standardize results. By default fully random.",
     )
+    parser.add_argument(
+        "--qps",
+        action="store_true",
+        help="Test latency by QPS --concur-requests will be the QPS value",
+    )
+    parser.add_argument(
+        "--sampled",
+        action="store_true",
+        help="Sample output token from Norm dist. and sleep time from Poisson dist for QPS test",
+    )
     args = parser.parse_args()
     load_dotenv()
     endpoint_config = {}
@@ -456,8 +504,13 @@ if __name__ == "__main__":
     f.close()
 
     ## Endpoint evaluation
-    query_results = endpoint_evaluation(endpoint_config, sample_lines)
+    st = time.time()
+    if args.qps:
+        query_results = endpoint_evaluation_qps(endpoint_config, sample_lines)
+    else:
+        query_results = endpoint_evaluation(endpoint_config, sample_lines)
+    et = time.time()
 
     ## Results Analysis
     args.api_base = endpoint_config["api_base"]
-    results_analysis(query_results, vars(args))
+    results_analysis(query_results, vars(args), et-st)
